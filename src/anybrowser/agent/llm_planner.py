@@ -55,8 +55,10 @@ the tag, or anything you read off the screenshot.
 - Act only on handles in the CURRENT listing. Handles from earlier turns are \
 stale and will be refused.
 - A result marked [no effect] means the action changed nothing. Doing it again \
-will change nothing again. Try something else: scroll, look, or pick a \
-different element.
+will change nothing again. Try something else: scroll, or pick a different \
+element.
+- The page listing and page text below are re-read fresh before every decision. \
+You never need to ask for them again.
 - A result marked [failed] means the action could not run at all. Read the \
 reason before choosing.
 - "narrative" is required, always, and must say why you chose this action -- \
@@ -76,13 +78,15 @@ class LLMPlanner(Planner):
         *,
         model: str,
         max_elements: int = 60,
+        max_text: int = 2000,
         temperature: float = 0.0,
-        max_tokens: int = 800,
+        max_tokens: int = 2048,
         system_prompt: str = SYSTEM_PROMPT,
     ) -> None:
         self._provider = provider
         self._model = model
         self._max_elements = max_elements
+        self._max_text = max_text
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._system_prompt = system_prompt
@@ -115,6 +119,30 @@ class LLMPlanner(Planner):
         if len(page.elements) > self._max_elements:
             hidden = len(page.elements) - self._max_elements
             lines.append(f"  … and {hidden} more not shown")
+
+        # What the page *says*, not just what can be clicked.
+        #
+        # The snapshot has carried this all along -- `snapshot(include_text=True)`
+        # is the default, so every observation already held it -- and this
+        # renderer dropped it. The cost was not subtle: an agent asked to report
+        # what a page said had no way to see any of it, so it re-read the page
+        # until the stuck breaker ended the run, and any goal phrased "tell me
+        # what it says" was unreachable. There was nothing to add but a few
+        # lines here.
+        text = (page.text or "").strip()
+        if text:
+            lines += ["", "Page text:"]
+            if len(text) > self._max_text:
+                # Mark the cut, so a model that needs the rest knows it exists
+                # rather than treating a sentence that stops mid-word as the end
+                # of the page.
+                lines.append(text[: self._max_text])
+                lines.append(
+                    f"  … {len(text) - self._max_text} more characters not shown; "
+                    "scroll or narrow the page to see the rest"
+                )
+            else:
+                lines.append(text)
         return "\n".join(lines)
 
     def _render_tools(self, tools: Sequence[Tool]) -> str:
@@ -135,7 +163,12 @@ class LLMPlanner(Planner):
             self._render_page(observation),
         ]
         if observation.history:
-            parts += ["", "WHAT YOU HAVE DONE:", render_history(observation.history)]
+            reads = {tool.name for tool in tools if not tool.mutating}
+            parts += [
+                "",
+                "WHAT YOU HAVE DONE:",
+                render_history(observation.history, reads=reads),
+            ]
         if observation.notes:
             parts += ["", "NOTES:", *(f"- {n}" for n in observation.notes)]
         parts += ["", f"Step {observation.step_index + 1}. Choose one action."]
@@ -172,6 +205,18 @@ class LLMPlanner(Planner):
     def _parse(self, text: str, tools: Sequence[Tool]) -> Decision:
         payload = _extract_json(text)
         if payload is None:
+            # Distinguish a reply that was cut off from one that was never JSON.
+            # An answer truncated by the token budget starts as valid JSON and
+            # simply stops, and reporting that as "did not return JSON" blames
+            # the model for a limit we set -- which is what happened: a long
+            # narrative ran past 800 tokens and killed the run several steps in.
+            stripped = text.strip()
+            if stripped.startswith("{") and not stripped.endswith("}"):
+                raise ModelError(
+                    f"the planner's reply was cut off after {self._max_tokens} tokens; "
+                    "raise max_tokens on LLMPlanner. Partial reply: "
+                    f"{stripped[-120:]!r}"
+                )
             raise ModelError(f"planner did not return JSON: {text[:300]!r}")
 
         narrative = str(payload.get("narrative") or "").strip()

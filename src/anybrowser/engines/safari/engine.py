@@ -38,6 +38,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,8 @@ from ...perception.dom import build_snapshot, decode_handle
 from .bridge import SafariBridge
 from .build import engine_app_path, on_macos
 from .channel import SafariExtensionChannel
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["SUPPORTED_CAPABILITIES", "SafariEngine"]
 
@@ -238,8 +242,68 @@ class SafariEngine(BrowserEngine):
         tabs = [t for t in listing.get("tabs", ()) if t.get("tab_id")]
         if not tabs:
             raise EngineNotAvailable("Safari reported no tabs")
-        chosen = next((t for t in tabs if t.get("active")), tabs[0])
-        self._tab_id = str(chosen["tab_id"])
+        await self._attach(tabs)
+
+    async def _attach(self, tabs: Sequence[Mapping[str, Any]]) -> None:
+        """Attach to the active tab, and wait for its page to be answering.
+
+        It has to be the *active* tab. The native half resolves a window by the
+        URL that window is displaying, so a background tab is invisible to
+        accessibility -- `webArea` raises "no Safari window is showing <url>".
+        Attaching to a readable background tab breaks input while appearing to
+        fix perception: measured at 12 contract failures against 1.
+
+        The wait is the fix for the cold-start flake. `start()` only needs the
+        background page to answer `tabs`, so it used to return while the content
+        script in the target tab was still coming up, and the first action that
+        needed the page lost the race -- the first run of a session failing
+        tests that passed on every run after it.
+
+        Where the active tab is browser chrome -- a freshly launched Safari shows
+        the Start Page -- there is no page to perceive and no way to make one:
+        content scripts do not run on `favorites://`, and not on `about:blank`
+        either, which I tried. So the engine says so and starts anyway. Native
+        input still works, and the first perception call explains itself.
+        """
+        active = next((t for t in tabs if t.get("active")), tabs[0])
+        self._tab_id = str(active["tab_id"])
+        if not await self._wait_for_page(timeout=3.0):
+            logger.info(
+                "the active tab (%s) has no content script, so nothing on it can be "
+                "perceived; navigate to a page, or grant the extension access to this "
+                "site. Native input does not need one.",
+                active.get("url") or "?",
+            )
+
+    async def _wait_for_page(self, *, timeout: float = 5.0, poll: float = 0.2) -> bool:
+        """Wait until a content script in the chosen tab answers.
+
+        An open socket is not a ready page. ``start()`` reaches the background
+        page -- that is all ``tabs`` needs -- and returns, while the content
+        script in the target tab may still be coming up. The first action that
+        needs the page then loses the race, which is why the first run of a
+        session failed tests that passed on every run after it.
+
+        Deliberately not fatal. The native half works on a page the extension
+        cannot see -- accessibility clicks, field writes and keystrokes all land
+        on an unpermitted site -- so refusing to start would take away something
+        that works. A page that never answers leaves the first perception call
+        to explain itself, which it now does by naming the missing site grant.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            with contextlib.suppress(Exception):
+                await self._read("href")
+                return True
+            if time.monotonic() >= deadline:
+                logger.debug(
+                    "no content script answered in tab %s within %.1fs; starting anyway, "
+                    "since native input does not need one",
+                    self._tab_id,
+                    timeout,
+                )
+                return False
+            await asyncio.sleep(poll)
 
     async def close(self) -> None:
         if self._channel is not None:
@@ -279,7 +343,8 @@ class SafariEngine(BrowserEngine):
             return result.get("value", result)
         return result
 
-    async def _signature(self) -> str:
+    async def page_signature(self) -> str:
+        """See :meth:`BrowserEngine.page_signature`."""
         with contextlib.suppress(Exception):
             return str(await self._read("signature"))
         return ""
@@ -288,7 +353,7 @@ class SafariEngine(BrowserEngine):
         """Decide honestly whether the page moved. See truthful-outcomes.md."""
         for _ in range(6):
             await asyncio.sleep(0.05)
-            if await self._signature() != before:
+            if await self.page_signature() != before:
                 return ActionOutcome(ok=True, changed=True, detail=changed)
         return ActionOutcome.no_change(unchanged)
 
@@ -366,39 +431,70 @@ class SafariEngine(BrowserEngine):
     # Navigation                                                          #
     # ------------------------------------------------------------------ #
 
-    async def _navigated(self, url: str) -> NavigationResult:
+    async def _navigated(self, url: str, *, previous: str | None = None) -> NavigationResult:
+        """Wait for the page to actually be somewhere else, then report where.
+
+        Taking the first non-blank URL after issuing a navigation reports the
+        page you were *leaving*: the old document is still current for a beat.
+        That is a lie about what happened, and an expensive one -- an agent told
+        it is still on the previous page navigates again, burning a step, which
+        is exactly what was observed driving Safari to Google.
+
+        So a result is accepted only when the URL either matches what was asked
+        for (a redirect to the canonical form counts) or differs from where we
+        started. ``previous`` is None where the destination is unknowable in
+        advance, as with history traversal.
+        """
         self._generation += 1
+        want = url.rstrip("/") if url else ""
         for _ in range(40):
             await asyncio.sleep(0.1)
             with contextlib.suppress(Exception):
                 current = await self.url()
-                if current and current != "about:blank":
+                if not current or current == "about:blank":
+                    continue
+                if want and current.rstrip("/") == want:
+                    return NavigationResult(url=current)
+                if previous is None or current != previous:
                     return NavigationResult(url=current)
         return NavigationResult(url=url)
 
     async def navigate(self, url: str, *, timeout: float = 30.0) -> NavigationResult:
+        previous = ""
+        with contextlib.suppress(Exception):
+            previous = await self.url()
         await self._require_channel().request(
             "navigate", {"tabId": self._tab_id, "url": url}, timeout=timeout
         )
-        return await self._navigated(url)
+        return await self._navigated(url, previous=previous)
 
     async def reload(self, *, timeout: float = 30.0) -> NavigationResult:
+        here = ""
+        with contextlib.suppress(Exception):
+            here = await self.url()
         await self._require_bridge().applescript(
             'tell application "Safari" to do JavaScript "location.reload()" in front document'
         )
-        return await self._navigated(await self.url())
+        # A reload lands on the same URL, so there is nothing to wait to change.
+        return await self._navigated(here)
 
     async def go_back(self, *, timeout: float = 30.0) -> NavigationResult:
+        previous = ""
+        with contextlib.suppress(Exception):
+            previous = await self.url()
         await self._require_bridge().applescript(
             'tell application "Safari" to do JavaScript "history.back()" in front document'
         )
-        return await self._navigated("")
+        return await self._navigated("", previous=previous)
 
     async def go_forward(self, *, timeout: float = 30.0) -> NavigationResult:
+        previous = ""
+        with contextlib.suppress(Exception):
+            previous = await self.url()
         await self._require_bridge().applescript(
             'tell application "Safari" to do JavaScript "history.forward()" in front document'
         )
-        return await self._navigated("")
+        return await self._navigated("", previous=previous)
 
     # ------------------------------------------------------------------ #
     # Input                                                               #
@@ -420,7 +516,7 @@ class SafariEngine(BrowserEngine):
         clipboard, media, file pickers -- while reporting success.
         """
         point = await self._point_for(target)
-        before = await self._signature()
+        before = await self.page_signature()
         url = await self.url()
         result = await self._require_bridge().press(
             window=self._window, x=point.x, y=point.y, url=url
@@ -468,7 +564,7 @@ class SafariEngine(BrowserEngine):
         keys have to go through ``key code``, which is why :data:`_KEY_CODES`
         exists; anything not in it is sent as text.
         """
-        before = await self._signature()
+        before = await self.page_signature()
         if key in _KEY_CODES:
             action = f"key code {_KEY_CODES[key]}"
         else:
@@ -524,13 +620,13 @@ class SafariEngine(BrowserEngine):
         events = [{"type": "pointerdown", "x": path[0].x, "y": path[0].y, "buttons": 1}]
         events += [{"type": "pointermove", "x": p.x, "y": p.y, "buttons": 1} for p in path[1:]]
         events.append({"type": "pointerup", "x": path[-1].x, "y": path[-1].y, "buttons": 0})
-        before = await self._signature()
+        before = await self.page_signature()
         await self._require_channel().request("pointer", {"tabId": self._tab_id, "events": events})
         return await self._settle(before, "dragged", "the drag moved nothing")
 
     async def hover(self, target: Element | Point) -> ActionOutcome:
         point = await self._point_for(target)
-        before = await self._signature()
+        before = await self.page_signature()
         await self._require_channel().request(
             "pointer",
             {

@@ -14,6 +14,70 @@ and a `BREAKING:` entry here.
 
 - The custom-engine reference skeleton now prints usage instructions when run
   directly instead of exiting silently.
+- Safari: the first run of a session failed tests that passed on every run
+  after it. `start()` only needs the background page to answer `tabs`, so it
+  returned while the content script in the target tab was still coming up, and
+  whatever acted first lost the race. It now waits for the page to be
+  answering, which is not fatal if it never does -- native input works on a page
+  the extension cannot see, and the first perception call explains itself.
+
+### Added
+
+- `BrowserEngine.await_change(timeout, poll, since)` and
+  `BrowserEngine.page_signature()`, neither abstract
+  ([ADR-0006](docs/adr/0006-waiting-is-an-engine-primitive.md)). Waiting for an
+  in-flight result to land is the one thing an agent cannot otherwise do, and it
+  belongs to browsers rather than to one loop. `page_signature` promotes what
+  all three engines already computed privately -- it is what `changed` has
+  always been built on -- with a default derived from `snapshot()` so no backend
+  has to implement either one. The daemon forwards it, so a `remote` engine
+  waits too.
+- Three conformance tests for it, including one that grades the fingerprint
+  directly: a signature that moves for an element change but not for a
+  text-only change fails, because a wait built on it returns early exactly when
+  a result lands as text. Nothing tested that before.
+- `pages/async.html`, a fixture whose text changes 700ms after a click, adding
+  and removing no elements.
+
+## [0.2.0] - 2026-10-02
+
+Safari works. In 0.1.0 its clicks silently never fired and every action reported
+`changed=False`, which is this project's own headline principle inverted. The
+agent could not read page text at all. The CLI could not be pointed at any
+model gateway. All of that is fixed below, and the Safari engine now passes its
+contract on a real machine.
+
+### Added
+
+- [ADR-0005](docs/adr/0005-agent-is-a-reference-loop.md): the agent runtime is a
+  reference loop, not the product. It exists to show the three plugin interfaces
+  composing, and a small tool surface is correct rather than incomplete.
+  Capabilities belong to the layers that are contract-graded -- one added to the
+  loop is available only to the loop, while the same one on `BrowserEngine` is
+  available to every loop and enforced by the suite.
+
+### Removed
+
+- The `look` tool. `AgentRunner` re-observes before every decision -- its
+  docstring says so and `_observe()` does it -- so `look` fetched a snapshot
+  that had already been taken for that same step. It cost a step, counted
+  toward the stuck breaker, and returned what the planner was holding anyway;
+  an agent asked to read a page would call it repeatedly and be stopped as
+  stuck. The prompt no longer suggests it, and says the page is re-read for
+  you.
+
+### Fixed
+
+- The planner never showed the page's **text**. `Snapshot.text` has been
+  populated all along -- `snapshot(include_text=True)` is the default -- and the
+  prompt renderer printed the URL, the title and the element list, then dropped
+  it. So an agent could see what was clickable and never what the page said:
+  any goal of the form "tell me what it says" was unreachable, and a search
+  that worked could not report its results. Rendered now, capped, with the cut
+  marked so a model knows there is more rather than reading a sentence that
+  stops mid-word as the end of the page.
+
+
 - Safari: **`AXManualAccessibility` was never set**, so WebKit handed out an
   accessibility tree that could be read but not acted on. Roles, titles and
   frames resolved, `AXPress` appeared in the element's actions, performing it

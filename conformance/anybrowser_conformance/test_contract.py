@@ -34,9 +34,18 @@ def test_info_identifies_the_browser(engine, run):
     assert info.browser, "info().browser must name the browser being driven"
 
 
-def test_start_is_idempotent(engine, run):
+def test_start_is_idempotent(engine, run, base_url):
+    """Starting twice is safe, and the engine can report where it is.
+
+    The navigation is load-bearing, not scene-setting. An engine that attaches
+    to a browser someone is already using may start on a page it cannot read --
+    a freshly launched Safari shows its Start Page, which is browser chrome, and
+    no content script runs there or on `about:blank`. Asserting a URL before
+    establishing a page tests the environment rather than the engine.
+    """
     run(engine.start())
     run(engine.start())
+    run(engine.navigate(f"{base_url}/index.html"))
     assert run(engine.url()) is not None
 
 
@@ -186,6 +195,49 @@ def test_press_key_reaches_the_page(engine, run, base_url):
     run(engine.navigate(f"{base_url}/index.html"))
     run(engine.press_key("Enter"))
     assert _log(engine, run) == "key:Enter"
+
+
+def test_await_change_waits_for_something_that_lands_late(engine, run, base_url):
+    """The case an agent cannot handle any other way: a result still in flight.
+
+    The fixture changes only its text, 700ms after the click, adding and
+    removing no elements. That is deliberate -- it is the shape of a request
+    returning, and an element-derived fingerprint does not move for it. An
+    engine whose page_signature ignores text fails here, which is the point.
+    """
+    run(engine.navigate(f"{base_url}/async.html"))
+    page = run(engine.snapshot())
+    run(engine.click(_find(page, "Start")))
+    outcome = run(engine.await_change(timeout=5.0))
+    assert outcome.ok and outcome.changed, "waited for a late change and did not see it"
+
+
+def test_await_change_reports_a_page_that_never_changes(engine, run, base_url):
+    """A timeout is an outcome, not an error.
+
+    An exception here would push callers into treating "not yet" as "broken",
+    and the honest answer -- nothing happened -- is the one ADR-0002 is about.
+    """
+    run(engine.navigate(f"{base_url}/async.html"))
+    outcome = run(engine.await_change(timeout=1.0, poll=0.1))
+    assert outcome.ok, "a page that did not change is not a failure"
+    assert not outcome.changed
+    assert "did not change" in outcome.detail
+
+
+def test_page_signature_moves_with_text_not_just_elements(engine, run, base_url):
+    """What await_change is built on, tested directly.
+
+    Clicking the fixture changes one paragraph's text and nothing else. A
+    signature that only fingerprints the element set reports no change, and
+    every wait built on it returns too early.
+    """
+    run(engine.navigate(f"{base_url}/async.html"))
+    before = run(engine.page_signature())
+    page = run(engine.snapshot())
+    run(engine.click(_find(page, "Start")))
+    after = run(engine.page_signature())
+    assert before != after, "the signature ignored a text-only change"
 
 
 def test_scroll_moves_and_reports_it(engine, run, base_url):

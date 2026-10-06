@@ -86,32 +86,48 @@ the page, which is a useful second route.
 
 ## Two traps when iterating
 
-**Replacing the app duplicates the extension and resets site permissions, so
-update it in place.** Deleting the old bundle and copying a new one leaves
-Safari's previous registration behind and adds another: Settings ▸ Extensions
-lists the extension twice with no way to tell which one is live, while
-`pluginkit` reports only one. The per-site grants go with it, and Safari injects
-no content script until a site is permitted again — so perception stops working
-and the contract skips, for reasons that look nothing like their cause.
+**The extension appears twice, and the second one is your build directory.**
+A built app is a complete app bundle, so macOS registers the extension inside it
+exactly as it registers the installed copy. Both then provide the same
+extension, and Settings ▸ Extensions lists it twice with no way to tell them
+apart. It is tempting to read that as a leftover of a previous install; it is
+not. `pluginkit -mAv | grep -i <your extension>` shows the paths and settles it
+in one line.
 
-Use the build script's installer, which rsyncs into the existing bundle instead:
+Use the build script's installer, which copies to `/Applications`, updates an
+existing bundle in place rather than replacing it, and unregisters its own build
+output:
 
 ```bash
 python scripts/build_safari_extension.py --convert build/ --install
 ```
 
-Measured: two consecutive in-place updates left Safari's entry count unchanged,
-where a delete-and-copy added one each time. If you already have duplicates,
-remove the stale ones in Settings ▸ Extensions once — in-place updates will not
-add more.
+Measured: with that, a full rebuild leaves exactly one registration. Replacing
+the bundle instead of updating it in place also resets the extension's per-site
+grants, and Safari injects no content script until a site is permitted again —
+so perception stops working and the contract skips, for reasons that look
+nothing like their cause.
 
-**Enabled is not permitted.** The tick in Settings ▸ Extensions, and the "can
-read and alter web pages you visit" banner, describe what the extension is
-allowed to *ask for*. Content scripts still do not run until a site is granted,
-which is a separate decision: click the toolbar button on a page and choose
-"Always Allow on Every Website". With nothing granted the bridge connects and
-still sees nothing, which reads like a broken engine rather than a missing
-permission.
+If a machine already has duplicates, `pluginkit -r <path to the stray .appex>`
+removes the registration, or delete the stray app bundle and restart Safari.
+
+**Enabled is not permitted, and the grant is per origin.** The tick in
+Settings ▸ Extensions, and the "can read and alter web pages you visit" banner,
+describe what the extension is allowed to *ask for*. `permissions.getAll()` says
+`<all_urls>` for the same reason, which makes it a useless check. Content
+scripts do not run until a *site* is granted, and granting one site grants only
+that site.
+
+This matters for the conformance suite, which serves its fixtures from
+`127.0.0.1`. Permitting the site you happen to be looking at is not enough:
+choose **Always Allow on Every Website**, or the suite's own pages stay
+unpermitted and every test that touches the page fails while the bridge itself
+connects happily.
+
+The bridge reports this in its greeting, so you do not have to guess. `hello`
+carries `content_script`, which is `"ok"` when a content script in the active
+tab answered and says so plainly when it did not — the difference between
+"unpermitted" and "broken" being otherwise invisible from the engine's side.
 
 ### 3. Run
 
